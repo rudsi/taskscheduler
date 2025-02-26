@@ -1,5 +1,7 @@
 package com.dts.taskscheduler.pkg.grpc;
 
+import java.io.IOException;
+
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.HeartbeatRequest;
@@ -7,10 +9,16 @@ import com.dts.taskscheduler.pkg.grpc.Api.HeartbeatResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskStatus;
 import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusResponse;
+import com.dts.taskscheduler.pkg.model.CoordinatorServer;
 
 import io.grpc.stub.StreamObserver;
 
 public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorServiceImplBase {
+    private final CoordinatorServer coordinatorServer;
+
+    public CoordinatorServiceImpl(CoordinatorServer coordinatorServer) {
+        this.coordinatorServer = coordinatorServer;
+    }
 
     @Override
     public void submitTask(ClientTaskRequest request, StreamObserver<ClientTaskResponse> responObserver) {
@@ -53,5 +61,15 @@ public class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorSe
 
         responseObserver.onNext(response);
         responseObserver.onCompleted();
+    }
+
+    public static void newServer(String port, String dbConnectionString) throws IOException, InterruptedException {
+        CoordinatorServer server = new CoordinatorServer(port, dbConnectionString);
+        server.startServer();
+        server.awaitTermination();
+    }
+
+    public void startGRPCServer(int port) throws IOException {
+        GRPC
     }
 }

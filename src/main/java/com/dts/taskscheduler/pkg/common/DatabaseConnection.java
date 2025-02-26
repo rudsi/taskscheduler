@@ -16,27 +16,12 @@ public class DatabaseConnection {
     private static final int RETRY_DELAY_SECONDS = 5;
     private static HikariDataSource dataSource;
 
-    public static String getDBConnectionString() {
-        String dbUser = System.getenv("POSTGRES_USER");
-        String dbPassword = System.getenv("POSTGRES_PASSWORD");
-        String dbName = System.getenv("POSTGRES_DB");
-        String dbHost = System.getenv("POSTGRES_HOST");
-
-        if (dbHost == null || dbHost.isEmpty()) {
-            dbHost = "localhost";
+    public static DataSource connectToDatabase(String dbConnectionString) {
+        if (dbConnectionString == null || dbConnectionString.isEmpty()) {
+            throw new IllegalArgumentException("Database connection string must not be null or empty.");
         }
-
-        if (dbUser == null || dbPassword == null || dbName == null) {
-            throw new IllegalStateException(
-                    "Missing required environment variables: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB");
-        }
-
-        return String.format("jdbc:postgresql://%s:5432/%s", dbHost, dbName);
-    }
-
-    public static DataSource connectToDatabase() {
         HikariConfig config = new HikariDataSource();
-        config.setJdbcUrl(getDBConnectionString());
+        config.setJdbcUrl(dbConnectionString);
         config.setUsername(System.getenv("POSTGRES_USER"));
         config.setPassword(System.getenv("POSTGRES_PASSWORD"));
         config.setMaximumPoolSize(10);
