@@ -6,48 +6,17 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 
 public class WorkerInfo {
-    private int heartbeatMisses;
+    private final int heartbeatMisses;
     private String address;
-    private ManagedChannel grpcConnection;
-    private WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient;
+    private final ManagedChannel grpcConnection;
+    private final WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient;
 
-    public WorkerInfo(String address, ManagedChannel grpcConnection,
-            WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient) {
-        this.heartbeatMisses = 0;
+    public WorkerInfo(String address, int heartbeatMisses, String host, int port) {
         this.address = address;
-        this.grpcConnection = ManagedChannelBuilder.forTarget(address)
+        this.heartbeatMisses = heartbeatMisses;
+        this.grpcConnection = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .build();
         this.workerServiceClient = WorkerServiceGrpc.newBlockingStub(grpcConnection);
-    }
-
-    public int getHeartbeatMisses() {
-        return heartbeatMisses;
-    }
-
-    public void incrementHeartbeatMisses() {
-        this.heartbeatMisses++;
-    }
-
-    public void resetHeartbeatMisses() {
-        this.heartbeatMisses = 0;
-    }
-
-    public String getAddress() {
-        return address;
-    }
-
-    public ManagedChannel getGrpcConnection() {
-        return grpcConnection;
-    }
-
-    public WorkerServiceGrpc.WorkerServiceBlockingStub getWorkerServiceClient() {
-        return workerServiceClient;
-    }
-
-    public void shutdownConnection() {
-        if (grpcConnection != null) {
-            grpcConnection.shutdown();
-        }
     }
 }
