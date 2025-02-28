@@ -89,4 +89,16 @@ public class CoordinatorServer {
         return this.workerPoolMutex;
     }
 
+    public List<Integer> getWorkerPoolKeys() {
+        return this.workerPoolKeys;
+    }
+
+    public ReentrantReadWriteLock getWorkerPoolKeysMutex() {
+        return this.workerPoolKeysMutex;
+    }
+
+    public AtomicInteger getRoundRobinIndex() {
+        return this.roundRobinIndex;
+    }
+
 }

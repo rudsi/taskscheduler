@@ -1,15 +1,25 @@
 package com.dts.taskscheduler.pkg.coordinator;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import javax.sql.DataSource;
 
 import com.dts.taskscheduler.pkg.common.DatabaseConnection;
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskResponse;
+import com.dts.taskscheduler.pkg.grpc.Api.TaskStatus;
+import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusRequest;
+import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusResponse;
 import com.dts.taskscheduler.pkg.grpc.CoordinatorServiceGrpc.CoordinatorServiceImplBase;
 import com.dts.taskscheduler.pkg.model.CoordinatorServer;
 import com.dts.taskscheduler.pkg.model.WorkerInfo;
@@ -17,6 +27,7 @@ import com.zaxxer.hikari.HikariDataSource;
 
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
+import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 
 public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
@@ -139,5 +150,82 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         if (server.getDbPool() != null) {
             ((HikariDataSource) server.getDbPool()).close();
         }
+    }
+
+    public void updateTaskStatus(CoordinatorServer server, UpdateTaskStatusRequest request,
+            StreamObserver<UpdateTaskStatusResponse> responseObserver) throws Exception {
+        TaskStatus status = request.getStatus();
+        String taskId = request.getTaskId();
+
+        Instant timestamp;
+        String column;
+
+        switch (status) {
+            case STARTED:
+                timestamp = Instant.ofEpochSecond(request.getStartedAt());
+                column = "started_at";
+                break;
+            case COMPLETED:
+                timestamp = Instant.ofEpochSecond(request.getCompletedAt());
+                column = "completed_at";
+                break;
+            case FAILED:
+                timestamp = Instant.ofEpochSecond(request.getFailedAt());
+                column = "failed_at";
+                break;
+            default:
+                System.out.println("Invalid status in UpdateStatusRequest");
+                throw new UnsupportedOperationException("Unsupported status: " + status);
+        }
+
+        String statement = String.format("UPDATE tasks SET %s = ? WHERE id = ?", column);
+        try (Connection conn = server.getDbPool().getConnection();
+                PreparedStatement stmt = conn.prepareStatement(statement)) {
+            stmt.setTimestamp(1, Timestamp.from(timestamp));
+            stmt.setString(2, taskId);
+
+            int rowsUpdated = stmt.executeUpdate();
+
+            if (rowsUpdated == 0) {
+                System.out.println("No rows updated for task: " + taskId);
+            }
+        } catch (SQLException e) {
+            System.err.println(String.format("could not update task status for task %s: %s", taskId, e));
+            throw e;
+        }
+
+        UpdateTaskStatusResponse response = UpdateTaskStatusResponse.newBuilder().setSuccess(true).build();
+        responseObserver.onNext(response);
+        responseObserver.onCompleted();
+    }
+
+    public WorkerInfo getNextWorker(CoordinatorServer server) {
+        server.getWorkerPoolKeysMutex().readLock().lock();
+        try {
+            int workerCount = server.getWorkerPoolKeys().size();
+            if (workerCount == 0) {
+                return null;
+            }
+            int index = server.getRoundRobinIndex().getAndIncrement() % workerCount;
+            int key = server.getWorkerPoolKeys().get(index);
+            return server.getWorkerPool().get(key);
+        } finally {
+            server.getWorkerPoolKeysMutex().readLock().unlock();
+        }
+    }
+
+    public void submitTaskToWorker(CoordinatorServer server, TaskRequest task) throws Exception {
+        WorkerInfo worker = getNextWorker(server);
+
+        if (worker == null) {
+            System.out.println("No workers available");
+        }
+
+        try {
+            worker.workerServiceClient().submitTask(task);
+        } catch (StatusRuntimeException e) {
+            System.err.println("Error submitting task: " + e.getStatus());
+        }
+
     }
 }
