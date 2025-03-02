@@ -2,13 +2,19 @@ package com.dts.taskscheduler.pkg.coordinator;
 
 import java.sql.Connection;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.sql.DataSource;
 
@@ -23,6 +29,7 @@ import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusResponse;
 import com.dts.taskscheduler.pkg.grpc.CoordinatorServiceGrpc.CoordinatorServiceImplBase;
 import com.dts.taskscheduler.pkg.model.CoordinatorServer;
 import com.dts.taskscheduler.pkg.model.WorkerInfo;
+import com.dts.taskscheduler.pkg.model.WorkerServer;
 import com.zaxxer.hikari.HikariDataSource;
 
 import io.grpc.Server;
@@ -32,6 +39,13 @@ import io.grpc.stub.StreamObserver;
 
 public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
     private final ExecutorService executorService = Executors.newCachedThreadPool();
+    private final CoordinatorServer server;
+    private volatile boolean running = true;
+    private static final long scanInterval = 5000;
+
+    public CoordinatorServiceImpl(CoordinatorServer server) {
+        this.server = server;
+    }
 
     @Override
     public void submitTask(ClientTaskRequest request, StreamObserver<ClientTaskResponse> responseObserver) {
@@ -62,7 +76,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
     public void start(CoordinatorServer server) throws Exception {
         executorService.submit(() -> {
             try {
-                manageWorkerPool();
+                manageWorkerPool(server);
             } catch (Exception e) {
                 e.printStackTrace();
             }
@@ -124,7 +138,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         try {
             for (WorkerInfo worker : server.getWorkerPool().values()) {
                 if (worker.getGRPCConnection() != null) {
-                    worker.getGRPCConnection().Shutdown();
+                    worker.getGRPCConnection().shutdown();
                 }
             }
         } finally {
@@ -214,7 +228,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         }
     }
 
-    public void submitTaskToWorker(CoordinatorServer server, TaskRequest task) throws Exception {
+    public boolean submitTaskToWorker(TaskRequest task) throws Exception {
         WorkerInfo worker = getNextWorker(server);
 
         if (worker == null) {
@@ -222,9 +236,131 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         }
 
         try {
-            worker.workerServiceClient().submitTask(task);
+            worker.getWorkerServiceClient().submitTask(task);
+            return true;
         } catch (StatusRuntimeException e) {
             System.err.println("Error submitting task: " + e.getStatus());
+            return false;
+        }
+    }
+
+    public void manageWorkerPool(CoordinatorServer server) {
+        server.getScheduler().scheduleAtFixedRate(() -> {
+            if (server.getShutdownSignal().isDone()) {
+                return;
+            }
+            removeInactiveWorkers(server);
+        }, 0, server.getMaxHeartbeatMisses() * server.getHeartbeatInterval().toMillis(), TimeUnit.MILLISECONDS);
+
+        executorService.submit(() -> {
+            try {
+                server.getShutdownLatch().await();
+                server.getScheduler().shutdown();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+    }
+
+    public void removeInactiveWorkers(CoordinatorServer server) {
+        server.getWorkerPoolMutex().lock();
+
+        try {
+            Iterator<Map.Entry<Integer, WorkerInfo>> iterator = server.getWorkerPool().entrySet().iterator();
+            while (iterator.hasNext()) {
+                Map.Entry<Integer, WorkerInfo> entry = iterator.next();
+                int workerId = entry.getKey();
+                WorkerInfo worker = entry.getValue();
+
+                if (worker.getHeartbeatMisses() > server.getMaxHeartbeatMisses()) {
+                    System.out.println("Removing inactive worker: " + workerId);
+                    worker.getGRPCConnection().shutdown();
+                    iterator.remove();
+
+                    server.getWorkerPoolKeysMutex().writeLock().lock();
+                    try {
+                        server.getWorkerPoolKeys().clear();
+                        server.getWorkerPoolKeys().addAll(server.getWorkerPool().keySet());
+                    } finally {
+                        server.getWorkerPoolKeysMutex().writeLock().unlock();
+                    }
+                } else {
+                    worker.incrementHeartbeatMisses();
+                }
+
+            }
+        } finally {
+            server.getWorkerPoolMutex().lock();
+        }
+    }
+
+    public void scanDatabase() {
+
+        server.getScheduler().scheduleAtFixedRate(() -> {
+            if (!running) {
+                System.out.println("Shutting down database scanner");
+                server.getScheduler().shutdown();
+                return;
+            }
+            executeAllScheduledTasks();
+        }, 0, scanInterval, TimeUnit.MILLISECONDS);
+    }
+
+    public void executeAllScheduledTasks() {
+        final int queryTimeoutSeconds = 30;
+
+        try (Connection conn = server.getDbPool().getConnection()) {
+            conn.setAutoCommit(false);
+            List<TaskRequest> tasks = new ArrayList<>();
+            String query = "SELECT id, command FROM tasks " +
+                    "WHERE scheduled_at < (NOW() + INTERVAL '30 seconds') " +
+                    "AND picked_at IS NULL " +
+                    "ORDER BY scheduled_at " +
+                    "FOR UPDATE SKIP LOCKED ";
+            try (PreparedStatement ps = conn.prepareStatement(query)) {
+                ps.setQueryTimeout(queryTimeoutSeconds);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String id = rs.getString("id");
+                        String command = rs.getString("command");
+                        TaskRequest task = TaskRequest.newBuilder().setTaskId(id).setData(command).build();
+                        tasks.add(task);
+                    }
+                }
+            } catch (SQLException e) {
+                System.out.println("Error executing query: " + e.getMessage());
+                conn.rollback();
+                return;
+            }
+
+            for (TaskRequest task : tasks) {
+                try {
+                    if (submitTaskToWorker(task)) {
+                        String updateQuery = "UPDATE tasks SET picked_At = NOW() WHERE id = ?";
+                        try (PreparedStatement psUpdate = conn.prepareStatement(updateQuery)) {
+                            psUpdate.setString(1, task.getTaskId());
+                            int rowsUpdated = psUpdate.executeUpdate();
+                            if (rowsUpdated == 0) {
+                                System.err.println("Failed to update task " + task.getTaskId());
+                            }
+                        }
+
+                    } else {
+                        System.out.println("Failed to submit task " + task.getTaskId());
+                    }
+                } catch (Exception e) {
+                    System.err.println("Error processing task " + task.getTaskId());
+                }
+            }
+
+            try {
+                conn.commit();
+            } catch (SQLException e) {
+                System.err.println("Failed to commit transaction: " + e.getMessage());
+            }
+
+        } catch (SQLException e) {
+            System.err.println("Unable to start transaction: " + e.getMessage());
         }
 
     }

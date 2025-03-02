@@ -6,10 +6,10 @@ import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 
 public class WorkerInfo {
-    private final int heartbeatMisses;
+    private int heartbeatMisses;
     private String address;
     private final ManagedChannel grpcConnection;
-    private final WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient;
+    private WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient;
 
     public WorkerInfo(String address, int heartbeatMisses, String host, int port) {
         this.address = address;
@@ -19,4 +19,30 @@ public class WorkerInfo {
                 .build();
         this.workerServiceClient = WorkerServiceGrpc.newBlockingStub(grpcConnection);
     }
+
+    public void incrementHeartbeatMisses() {
+        this.heartbeatMisses++;
+    }
+
+    public int getHeartbeatMisses() {
+        return heartbeatMisses;
+    }
+
+    public String getAddress() {
+        return address;
+    }
+
+    public ManagedChannel getGRPCConnection() {
+        return grpcConnection;
+    }
+
+    public WorkerServiceGrpc.WorkerServiceBlockingStub getWorkerServiceClient() {
+        return workerServiceClient;
+    }
+
+    public void setWorkerServiceClient(
+            WorkerServiceGrpc.WorkerServiceBlockingStub workerServiceClient) {
+        this.workerServiceClient = workerServiceClient;
+    }
+
 }

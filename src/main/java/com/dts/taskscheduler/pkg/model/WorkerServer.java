@@ -4,6 +4,7 @@ import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,12 +22,12 @@ import io.grpc.Server;
 
 public class WorkerServer {
     private final int id;
-    private final String serverPort;
+    private String serverPort;
     private final String coordinatorAddress;
     private ServerSocket listener;
     private Server grpcServer;
-    private ManagedChannel coordinatorChannel;
-    private CoordinatorServiceGrpc.CoordinatorServiceStub coordinatorServiceClient;
+    private ManagedChannel grpcConnection;
+    private CoordinatorServiceGrpc.CoordinatorServiceBlockingStub coordinatorServiceClient;
     private final Duration heartbeatInterval;
     private final BlockingQueue<TaskRequest> taskQueue;
     private final Map<String, TaskRequest> receivedTasks;
@@ -36,10 +37,11 @@ public class WorkerServer {
     private ScheduledFuture<?> heartbeatFuture;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean cancelToken = new AtomicBoolean(false);
+    private final CountDownLatch shutdownLatch;
 
     public WorkerServer(int id, String serverPort, String coordinatorAddress, Duration heartbeatInterval,
             BlockingQueue<TaskRequest> taskQueue, Map<String, TaskRequest> receivedTasks,
-            ReentrantLock receivedTasksLock, ExecutorService executorService) {
+            ReentrantLock receivedTasksLock, ExecutorService executorService, CountDownLatch shutDownLatch) {
         this.id = id;
         this.serverPort = serverPort;
         this.coordinatorAddress = coordinatorAddress;
@@ -48,6 +50,7 @@ public class WorkerServer {
         this.receivedTasks = receivedTasks;
         this.receivedTasksLock = receivedTasksLock;
         this.executorService = executorService;
+        this.shutdownLatch = shutDownLatch;
     }
 
     public int getId() {
@@ -58,12 +61,20 @@ public class WorkerServer {
         return cancelToken;
     }
 
+    public CountDownLatch getShutdownLatch() {
+        return this.shutdownLatch;
+    }
+
     public void setCancelToken() {
         this.cancelToken.set(true);
     }
 
     public String getServerPort() {
         return serverPort;
+    }
+
+    public void setServerPort(String serverPort) {
+        this.serverPort = serverPort;
     }
 
     public ScheduledExecutorService getScheduler() {
@@ -102,19 +113,20 @@ public class WorkerServer {
         this.grpcServer = grpcServer;
     }
 
-    public ManagedChannel getCoordinatorChannel() {
-        return coordinatorChannel;
+    public ManagedChannel getGRPCConnection() {
+        return grpcConnection;
     }
 
-    public void setCoordinatorChannel(ManagedChannel coordinatorChannel) {
-        this.coordinatorChannel = coordinatorChannel;
+    public void setGRPCConnection(ManagedChannel grpcConnection) {
+        this.grpcConnection = grpcConnection;
     }
 
-    public CoordinatorServiceGrpc.CoordinatorServiceStub getCoordinatorServiceClient() {
+    public CoordinatorServiceGrpc.CoordinatorServiceBlockingStub getCoordinatorServiceClient() {
         return coordinatorServiceClient;
     }
 
-    public void setCoordinatorServiceClient(CoordinatorServiceGrpc.CoordinatorServiceStub coordinatorServiceClient) {
+    public void setCoordinatorServiceClient(
+            CoordinatorServiceGrpc.CoordinatorServiceBlockingStub coordinatorServiceClient) {
         this.coordinatorServiceClient = coordinatorServiceClient;
     }
 
