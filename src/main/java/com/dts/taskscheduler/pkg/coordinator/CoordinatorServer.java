@@ -1,5 +1,6 @@
 package com.dts.taskscheduler.pkg.coordinator;
 
+import java.net.ServerSocket;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -12,9 +13,16 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.sql.DataSource;
 
@@ -22,29 +30,53 @@ import com.dts.taskscheduler.pkg.common.DatabaseConnection;
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskRequest;
-import com.dts.taskscheduler.pkg.grpc.Api.TaskResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskStatus;
 import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusResponse;
 import com.dts.taskscheduler.pkg.grpc.CoordinatorServiceGrpc.CoordinatorServiceImplBase;
-import com.dts.taskscheduler.pkg.model.CoordinatorServer;
 import com.dts.taskscheduler.pkg.model.WorkerInfo;
-import com.dts.taskscheduler.pkg.model.WorkerServer;
-import com.zaxxer.hikari.HikariDataSource;
 
+import com.zaxxer.hikari.HikariDataSource;
 import io.grpc.Server;
 import io.grpc.ServerBuilder;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 
-public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
-    private final ExecutorService executorService = Executors.newCachedThreadPool();
-    private final CoordinatorServer server;
+public class CoordinatorServer extends CoordinatorServiceImplBase {
     private volatile boolean running = true;
     private static final long scanInterval = 5000;
+    private final String serverPort;
+    private ServerSocket listener;
+    private Server grpcServer;
+    private final Map<Integer, WorkerInfo> workerPool;
+    private final ReentrantLock workerPoolMutex;
+    private final List<Integer> workerPoolKeys;
+    private final ReentrantReadWriteLock workerPoolKeysMutex;
+    private final int maxHeartbeatMisses;
+    private final Duration heartbeatInterval;
+    private final AtomicInteger roundRobinIndex;
+    private String dbConnectionString;
+    private DataSource dbPool;
+    private final ExecutorService executorService;
+    private ScheduledExecutorService scheduler;
+    private final CountDownLatch shutdownLatch;
+    private CompletableFuture<Void> shutdownSignal;
 
-    public CoordinatorServiceImpl(CoordinatorServer server) {
-        this.server = server;
+    public CoordinatorServer(String serverPort, String dbConnectioString, int maxHeartbeatMisses,
+            Duration heartbeatInterval) {
+        this.serverPort = serverPort;
+        this.dbConnectionString = dbConnectioString;
+        this.maxHeartbeatMisses = maxHeartbeatMisses;
+        this.heartbeatInterval = heartbeatInterval;
+        this.workerPool = new ConcurrentHashMap<>();
+        this.workerPoolMutex = new ReentrantLock();
+        this.workerPoolKeys = new ArrayList<>();
+        this.workerPoolKeysMutex = new ReentrantReadWriteLock();
+        this.roundRobinIndex = new AtomicInteger(0);
+        this.executorService = Executors.newCachedThreadPool();
+        this.scheduler = Executors.newSingleThreadScheduledExecutor();
+        this.shutdownLatch = new CountDownLatch(maxHeartbeatMisses);
+        this.shutdownSignal = new CompletableFuture<>();
     }
 
     @Override
@@ -67,34 +99,34 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
 
     }
 
-    public CoordinatorServer newServer(String port, String dbConnectionString) {
+    public static CoordinatorServer newServer(String port, String dbConnectionString) {
         int defaultMaxMisses = 3;
         Duration defaultHearbeat = Duration.ofSeconds(5);
         return new CoordinatorServer(port, dbConnectionString, defaultMaxMisses, defaultHearbeat);
     }
 
-    public void start(CoordinatorServer server) throws Exception {
-        executorService.submit(() -> {
+    public void start() throws Exception {
+        this.executorService.submit(() -> {
             try {
-                manageWorkerPool(server);
+                manageWorkerPool();
             } catch (Exception e) {
                 e.printStackTrace();
             }
         });
 
         try {
-            startGRPCServer(server);
+            startGRPCServer();
         } catch (Exception e) {
             throw new Exception("gRPC server failed to start: " + e.getMessage());
         }
 
         try {
-            server.setDbPool(DatabaseConnection.connectToDatabase(server.getDbConnectionString()));
+            dbPool = DatabaseConnection.connectToDatabase(dbConnectionString);
         } catch (Exception e) {
             throw e;
         }
 
-        executorService.submit(() -> {
+        this.executorService.submit(() -> {
             try {
                 scanDatabase();
             } catch (Exception e) {
@@ -102,52 +134,52 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
             }
         });
 
-        awaitShutdown(server);
+        awaitShutdown();
     }
 
-    public void startGRPCServer(CoordinatorServer server) throws Exception {
+    public void startGRPCServer() throws Exception {
 
-        System.out.println("Starting gRPC server on " + server.getServerPort());
-        server.setGRPCServer(ServerBuilder.forPort(50052).addService(this).build());
-        server.getGRPCServer().start();
+        System.out.println("Starting gRPC server on " + this.serverPort);
+        grpcServer = ServerBuilder.forPort(50052).addService(this).build();
+        grpcServer.start();
 
-        executorService.submit(() -> {
+        this.executorService.submit(() -> {
             try {
-                server.getGRPCServer().awaitTermination();
+                grpcServer.awaitTermination();
             } catch (Exception e) {
                 System.err.println("gRPC server interrupted: " + e.getMessage());
             }
         });
     }
 
-    public void awaitShutdown(CoordinatorServer server) throws Exception {
+    public void awaitShutdown() throws Exception {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Shutdown signal received. Releasing latch.");
-            server.getShutdownLatch().countDown();
+            this.shutdownLatch.countDown();
         }));
 
-        server.getShutdownLatch().await();
-        stop(server);
+        this.shutdownLatch.await();
+        stop();
     }
 
-    public void stop(CoordinatorServer server) throws Exception {
+    public void stop() throws Exception {
         executorService.shutdownNow();
 
-        server.getWorkerPoolMutex().lock();
+        workerPoolMutex.lock();
 
         try {
-            for (WorkerInfo worker : server.getWorkerPool().values()) {
+            for (WorkerInfo worker : workerPool.values()) {
                 if (worker.getGRPCConnection() != null) {
                     worker.getGRPCConnection().shutdown();
                 }
             }
         } finally {
-            server.getWorkerPoolMutex().unlock();
+            workerPoolMutex.unlock();
         }
 
-        if (server.getGRPCServer() != null) {
-            server.getGRPCServer().shutdown();
-            while (!server.getGRPCServer().isTerminated()) {
+        if (grpcServer != null) {
+            grpcServer.shutdown();
+            while (!grpcServer.isTerminated()) {
                 try {
                     Thread.sleep(100);
                 } catch (InterruptedException e) {
@@ -157,17 +189,17 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
             }
         }
 
-        if (server.getListener() != null) {
-            server.getListener().close();
+        if (listener != null) {
+            listener.close();
         }
 
-        if (server.getDbPool() != null) {
-            ((HikariDataSource) server.getDbPool()).close();
+        if (dbPool != null) {
+            ((HikariDataSource) dbPool).close();
         }
     }
 
-    public void updateTaskStatus(CoordinatorServer server, UpdateTaskStatusRequest request,
-            StreamObserver<UpdateTaskStatusResponse> responseObserver) throws Exception {
+    public void updateTaskStatus(UpdateTaskStatusRequest request,
+            StreamObserver<UpdateTaskStatusResponse> responseObserver) {
         TaskStatus status = request.getStatus();
         String taskId = request.getTaskId();
 
@@ -193,7 +225,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         }
 
         String statement = String.format("UPDATE tasks SET %s = ? WHERE id = ?", column);
-        try (Connection conn = server.getDbPool().getConnection();
+        try (Connection conn = dbPool.getConnection();
                 PreparedStatement stmt = conn.prepareStatement(statement)) {
             stmt.setTimestamp(1, Timestamp.from(timestamp));
             stmt.setString(2, taskId);
@@ -205,7 +237,6 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
             }
         } catch (SQLException e) {
             System.err.println(String.format("could not update task status for task %s: %s", taskId, e));
-            throw e;
         }
 
         UpdateTaskStatusResponse response = UpdateTaskStatusResponse.newBuilder().setSuccess(true).build();
@@ -213,23 +244,23 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         responseObserver.onCompleted();
     }
 
-    public WorkerInfo getNextWorker(CoordinatorServer server) {
-        server.getWorkerPoolKeysMutex().readLock().lock();
+    public WorkerInfo getNextWorker() {
+        workerPoolKeysMutex.readLock().lock();
         try {
-            int workerCount = server.getWorkerPoolKeys().size();
+            int workerCount = workerPoolKeys.size();
             if (workerCount == 0) {
                 return null;
             }
-            int index = server.getRoundRobinIndex().getAndIncrement() % workerCount;
-            int key = server.getWorkerPoolKeys().get(index);
-            return server.getWorkerPool().get(key);
+            int index = roundRobinIndex.getAndIncrement() % workerCount;
+            int key = workerPoolKeys.get(index);
+            return workerPool.get(key);
         } finally {
-            server.getWorkerPoolKeysMutex().readLock().unlock();
+            workerPoolKeysMutex.readLock().unlock();
         }
     }
 
     public boolean submitTaskToWorker(TaskRequest task) throws Exception {
-        WorkerInfo worker = getNextWorker(server);
+        WorkerInfo worker = getNextWorker();
 
         if (worker == null) {
             System.out.println("No workers available");
@@ -244,45 +275,45 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
         }
     }
 
-    public void manageWorkerPool(CoordinatorServer server) {
-        server.getScheduler().scheduleAtFixedRate(() -> {
-            if (server.getShutdownSignal().isDone()) {
+    public void manageWorkerPool() {
+        scheduler.scheduleAtFixedRate(() -> {
+            if (shutdownSignal.isDone()) {
                 return;
             }
-            removeInactiveWorkers(server);
-        }, 0, server.getMaxHeartbeatMisses() * server.getHeartbeatInterval().toMillis(), TimeUnit.MILLISECONDS);
+            removeInactiveWorkers();
+        }, 0, maxHeartbeatMisses * heartbeatInterval.toMillis(), TimeUnit.MILLISECONDS);
 
         executorService.submit(() -> {
             try {
-                server.getShutdownLatch().await();
-                server.getScheduler().shutdown();
+                shutdownLatch.await();
+                scheduler.shutdown();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         });
     }
 
-    public void removeInactiveWorkers(CoordinatorServer server) {
-        server.getWorkerPoolMutex().lock();
+    public void removeInactiveWorkers() {
+        workerPoolMutex.lock();
 
         try {
-            Iterator<Map.Entry<Integer, WorkerInfo>> iterator = server.getWorkerPool().entrySet().iterator();
+            Iterator<Map.Entry<Integer, WorkerInfo>> iterator = workerPool.entrySet().iterator();
             while (iterator.hasNext()) {
                 Map.Entry<Integer, WorkerInfo> entry = iterator.next();
                 int workerId = entry.getKey();
                 WorkerInfo worker = entry.getValue();
 
-                if (worker.getHeartbeatMisses() > server.getMaxHeartbeatMisses()) {
+                if (worker.getHeartbeatMisses() > maxHeartbeatMisses) {
                     System.out.println("Removing inactive worker: " + workerId);
                     worker.getGRPCConnection().shutdown();
                     iterator.remove();
 
-                    server.getWorkerPoolKeysMutex().writeLock().lock();
+                    workerPoolKeysMutex.writeLock().lock();
                     try {
-                        server.getWorkerPoolKeys().clear();
-                        server.getWorkerPoolKeys().addAll(server.getWorkerPool().keySet());
+                        workerPoolKeys.clear();
+                        workerPoolKeys.addAll(workerPool.keySet());
                     } finally {
-                        server.getWorkerPoolKeysMutex().writeLock().unlock();
+                        workerPoolKeysMutex.writeLock().unlock();
                     }
                 } else {
                     worker.incrementHeartbeatMisses();
@@ -290,16 +321,16 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
 
             }
         } finally {
-            server.getWorkerPoolMutex().lock();
+            workerPoolMutex.lock();
         }
     }
 
     public void scanDatabase() {
 
-        server.getScheduler().scheduleAtFixedRate(() -> {
+        scheduler.scheduleAtFixedRate(() -> {
             if (!running) {
                 System.out.println("Shutting down database scanner");
-                server.getScheduler().shutdown();
+                scheduler.shutdown();
                 return;
             }
             executeAllScheduledTasks();
@@ -309,7 +340,7 @@ public class CoordinatorServiceImpl extends CoordinatorServiceImplBase {
     public void executeAllScheduledTasks() {
         final int queryTimeoutSeconds = 30;
 
-        try (Connection conn = server.getDbPool().getConnection()) {
+        try (Connection conn = dbPool.getConnection()) {
             conn.setAutoCommit(false);
             List<TaskRequest> tasks = new ArrayList<>();
             String query = "SELECT id, command FROM tasks " +

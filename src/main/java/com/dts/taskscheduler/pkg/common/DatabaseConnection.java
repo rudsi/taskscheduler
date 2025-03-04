@@ -2,6 +2,8 @@ package com.dts.taskscheduler.pkg.common;
 
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -50,6 +52,39 @@ public class DatabaseConnection {
 
         throw new RuntimeException("Ran out of retries to connect to database (" + MAX_RETRIES + ")");
 
+    }
+
+    public static String getDBConnectionString() {
+        List<String> missingEnvVars = new ArrayList<>();
+
+        String dbUser = System.getenv("POSTGRES_USER");
+        if (dbUser == null || dbUser.isEmpty()) {
+            missingEnvVars.add("POSTGRES_USER");
+        }
+
+        String dbPassword = System.getenv("POSTGRES_PASSWORD");
+        if (dbPassword == null || dbPassword.isEmpty()) {
+            missingEnvVars.add("POSTGRES_PASSWORD");
+        }
+
+        String dbName = System.getenv("POSTGRES_DB");
+        if (dbName == null || dbName.isEmpty()) {
+            missingEnvVars.add("POSTGRES_DB");
+        }
+
+        String dbHost = System.getenv("POSTGRES_HOST");
+        if (dbHost == null || dbHost.isEmpty()) {
+            dbHost = "localhost";
+        }
+
+        if (!missingEnvVars.isEmpty()) {
+            String errorMessage = "The following required environment variables are not set: "
+                    + String.join(", ", missingEnvVars);
+            System.err.println(errorMessage);
+            System.exit(1);
+        }
+
+        return String.format("postgres://%s:%s@%s:5432/%s", dbUser, dbPassword, dbHost, dbName);
     }
 
 }

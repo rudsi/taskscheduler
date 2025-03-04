@@ -3,6 +3,7 @@ package com.dts.taskscheduler.pkg.worker;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -10,7 +11,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
@@ -20,18 +25,45 @@ import com.dts.taskscheduler.pkg.grpc.Api.TaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskStatus;
 import com.dts.taskscheduler.pkg.grpc.Api.UpdateTaskStatusRequest;
 import com.dts.taskscheduler.pkg.grpc.WorkerServiceGrpc.WorkerServiceImplBase;
-import com.dts.taskscheduler.pkg.model.WorkerServer;
 
-import io.grpc.BindableService;
+import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Server;
 import io.grpc.ServerBuilder;
-import io.grpc.channelz.v1.Server;
 
-public class WorkerServiceImpl extends WorkerServiceImplBase {
+public class WorkerServer extends WorkerServiceImplBase {
     private static final Logger logger = Logger.getLogger(WorkerServer.class.getName());
     private static final Duration DEFAULT_HEARTBEAT = Duration.ofSeconds(10);
     private static final int workerPoolSize = 5;
     private final Duration taskProcessTime = Duration.ofSeconds(5);
+
+    private final int id;
+    private String serverPort;
+    private final String coordinatorAddress;
+    private ServerSocket listener;
+    private Server grpcServer;
+    private ManagedChannel grpcConnection;
+    private CoordinatorServiceGrpc.CoordinatorServiceBlockingStub coordinatorServiceClient;
+    private final Duration heartbeatInterval;
+    private final BlockingQueue<TaskRequest> taskQueue;
+    private final ExecutorService executorService;
+    private final AtomicInteger activeTasks = new AtomicInteger(0);
+    private ScheduledFuture<?> heartbeatFuture;
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final AtomicBoolean cancelToken = new AtomicBoolean(false);
+    private final CountDownLatch shutdownLatch;
+
+    public WorkerServer(int id, String serverPort, String coordinatorAddress, Duration heartbeatInterval,
+            BlockingQueue<TaskRequest> taskQueue, Map<String, TaskRequest> receivedTasks,
+            ReentrantLock receivedTasksLock, ExecutorService executorService, CountDownLatch shutDownLatch) {
+        this.id = id;
+        this.serverPort = serverPort;
+        this.coordinatorAddress = coordinatorAddress;
+        this.heartbeatInterval = heartbeatInterval;
+        this.taskQueue = taskQueue;
+        this.executorService = executorService;
+        this.shutdownLatch = shutDownLatch;
+    }
 
     public WorkerServer newServer(String port, String coordinator) {
         return new WorkerServer(
@@ -54,24 +86,23 @@ public class WorkerServiceImpl extends WorkerServiceImplBase {
         startWorkerPool(server, workerPoolSize);
 
         try {
-            periodicHeartbeat(server);
-            startGRPCServer(server);
-            awaitShutdown(server);
+            periodicHeartbeat();
+            startGRPCServer();
+            awaitShutdown();
         } catch (Exception e) {
             System.out.println(e.getMessage());
         } finally {
-            closeGRPCConnection(server);
+            closeGRPCConnection();
         }
-        awaitShutdown(server);
+        awaitShutdown();
     }
 
     public boolean connectToCoordinator(WorkerServer server) throws Exception {
         System.out.println("Connecting to coordinator...");
 
         try {
-            server.setGRPCConnection(
-                    ManagedChannelBuilder.forTarget(server.getCoordinatorAddress()).usePlaintext().build());
-            server.setCoordinatorServiceClient(CoordinatorServiceGrpc.newBlockingStub(server.getGRPCConnection()));
+            grpcConnection = ManagedChannelBuilder.forTarget(coordinatorAddress).usePlaintext().build();
+            coordinatorServiceClient = CoordinatorServiceGrpc.newBlockingStub(grpcConnection);
             logger.info("Connected to coordinator!");
             return true;
         } catch (Exception e) {
@@ -81,12 +112,12 @@ public class WorkerServiceImpl extends WorkerServiceImplBase {
 
     }
 
-    public void periodicHeartbeat(WorkerServer server) {
-        server.getActiveTasks().incrementAndGet();
+    public void periodicHeartbeat() {
+        activeTasks.incrementAndGet();
 
         Runnable heartbeatTask = () -> {
             try {
-                if (!sendHeartbeat(server)) {
+                if (!sendHeartbeat()) {
                     System.out.println("Failed to send heartbeat");
                 }
             } catch (Exception e) {
@@ -94,72 +125,68 @@ public class WorkerServiceImpl extends WorkerServiceImplBase {
             }
         };
 
-        server.setHeartbeatFuture(server.getScheduler().scheduleAtFixedRate(
+        heartbeatFuture = scheduler.scheduleAtFixedRate(
                 heartbeatTask,
                 0,
-                server.getHeartbeatInterval().toMillis(),
-                TimeUnit.MILLISECONDS));
+                heartbeatInterval.toMillis(),
+                TimeUnit.MILLISECONDS);
 
-        server.setHeartbeatFuture(server.getHeartbeatFuture());
-
-        server.getExecutorService().submit(() -> {
+        executorService.submit(() -> {
             try {
-                awaitShutdown(server);
-                server.getHeartbeatFuture().cancel(true);
+                awaitShutdown();
+                heartbeatFuture.cancel(true);
             } catch (Exception e) {
                 System.err.println("server shutdown interrupted.");
             }
         });
     }
 
-    public void stop(WorkerServer server) {
+    public void stop() {
         System.out.println("Stopping Worker Server...");
 
-        if (server.getHeartbeatFuture() != null) {
-            server.getHeartbeatFuture().cancel(true);
+        if (heartbeatFuture != null) {
+            heartbeatFuture.cancel(true);
         }
 
-        server.getExecutorService().shutdown();
+        executorService.shutdown();
         try {
-            if (!server.getExecutorService().awaitTermination(5, TimeUnit.SECONDS)) {
-                server.getExecutorService().shutdownNow();
+            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                executorService.shutdownNow();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             System.err.println("ExecutorService shutdown interrupted: " + e.getMessage());
         }
 
-        closeGRPCConnection(server);
+        closeGRPCConnection();
         System.out.println("Worker server stopped.");
     }
 
     public void startWorkerPool(WorkerServer server, int numWorkers) {
         System.out.println("Starting worker pool with " + numWorkers + " workers...");
-        ExecutorService executorService = server.getExecutorService();
         for (int i = 0; i < numWorkers; i++) {
-            executorService.submit(() -> worker(server));
+            executorService.submit(() -> worker());
         }
     }
 
-    public void worker(WorkerServer server) {
-        server.getActiveTasks().incrementAndGet();
-        ExecutorService executorService = server.getExecutorService();
+    public void worker() {
+        activeTasks.incrementAndGet();
 
-        while (!server.getCancelToken().get()) {
+        while (!cancelToken.get()) {
             try {
-                TaskRequest task = server.getTaskQueue().take();
-                executorService.submit(() -> updateTaskStatus(server, task, TaskStatus.STARTED));
-                processTask(server, task);
-                executorService.submit(() -> updateTaskStatus(server, task, TaskStatus.COMPLETED));
+                TaskRequest task = taskQueue.take();
+                executorService.submit(() -> updateTaskStatus(task, TaskStatus.STARTED));
+                processTask(task);
+                executorService.submit(() -> updateTaskStatus(task, TaskStatus.COMPLETED));
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
         }
-        server.getActiveTasks().decrementAndGet();
+        activeTasks.decrementAndGet();
     }
 
-    public void processTask(WorkerServer server, TaskRequest task) {
+    public void processTask(TaskRequest task) {
         System.out.println("Processing task :" + task);
 
         try {
@@ -172,19 +199,19 @@ public class WorkerServiceImpl extends WorkerServiceImplBase {
         System.out.println("Completed task: " + task);
     }
 
-    public boolean sendHeartbeat(WorkerServer server) throws Exception {
+    public boolean sendHeartbeat() throws Exception {
         String workerAddress = System.getenv("WORKER_ADDRESS");
         if (workerAddress == null || workerAddress.isEmpty()) {
-            workerAddress = server.getListener().getInetAddress().getHostAddress() + ":"
-                    + server.getListener().getLocalPort();
+            workerAddress = listener.getInetAddress().getHostAddress() + ":"
+                    + listener.getLocalPort();
         } else {
-            workerAddress += server.getServerPort();
+            workerAddress += serverPort;
         }
 
-        HeartbeatRequest request = HeartbeatRequest.newBuilder().setWorkerId(server.getId())
+        HeartbeatRequest request = HeartbeatRequest.newBuilder().setWorkerId(id)
                 .setAddress(workerAddress).build();
         try {
-            CoordinatorServiceGrpc.CoordinatorServiceBlockingStub stub = server.getCoordinatorServiceClient();
+            CoordinatorServiceGrpc.CoordinatorServiceBlockingStub stub = coordinatorServiceClient;
             stub.sendHeartbeat(request);
             return true;
 
@@ -194,63 +221,63 @@ public class WorkerServiceImpl extends WorkerServiceImplBase {
         }
     }
 
-    public void startGRPCServer(WorkerServer server) throws Exception {
+    public void startGRPCServer() throws Exception {
 
-        if (server.getServerPort() == null || server.getServerPort().isEmpty()) {
-            server.setListener(new ServerSocket(0));
-            server.setServerPort(":" + server.getListener().getLocalPort());
+        if (serverPort == null || serverPort.isEmpty()) {
+            listener = new ServerSocket(0);
+            serverPort = (":" + listener.getLocalPort());
         } else {
-            server.setListener(new ServerSocket());
-            server.getListener().bind(new InetSocketAddress(Integer.parseInt(server.getServerPort().replace(":", ""))));
+            listener = new ServerSocket();
+            listener.bind(new InetSocketAddress(Integer.parseInt(serverPort.replace(":", ""))));
         }
 
-        server.setGrpcServer(ServerBuilder.forPort(Integer.parseInt(server.getServerPort())).addService(this).build());
-        server.getGrpcServer().start();
+        grpcServer = ServerBuilder.forPort(Integer.parseInt(serverPort)).addService(this).build();
+        grpcServer.start();
 
-        server.getExecutorService().submit(() -> {
+        executorService.submit(() -> {
             try {
-                server.getGrpcServer().awaitTermination();
+                grpcServer.awaitTermination();
             } catch (Exception e) {
                 System.err.println("gRPC server interrupted: " + e.getMessage());
             }
         });
     }
 
-    public void awaitShutdown(WorkerServer server) throws Exception {
+    public void awaitShutdown() throws Exception {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Shutdown signal received. Releasing latch.");
-            server.getShutdownLatch().countDown();
+            shutdownLatch.countDown();
         }));
-        server.getShutdownLatch().await();
-        stop(server);
+        shutdownLatch.await();
+        stop();
     }
 
-    public void closeGRPCConnection(WorkerServer server) {
-        if (server.getGrpcServer() != null) {
-            server.getGrpcServer().shutdown();
+    public void closeGRPCConnection() {
+        if (grpcConnection != null) {
+            grpcConnection.shutdown();
             logger.info("gRPC server stopped.");
         }
 
-        if (server.getListener() != null) {
+        if (listener != null) {
             try {
-                server.getListener().close();
+                listener.close();
             } catch (Exception e) {
                 logger.warning("Error while closing the listener: " + e.getMessage());
             }
         }
 
-        if (server.getGRPCConnection() != null) {
-            server.getGRPCConnection().shutdown();
+        if (grpcConnection != null) {
+            grpcConnection.shutdown();
             logger.info("Closed client connection with coordinator.");
         }
     }
 
-    public void updateTaskStatus(WorkerServer server, TaskRequest task, TaskStatus status) {
+    public void updateTaskStatus(TaskRequest task, TaskStatus status) {
         UpdateTaskStatusRequest request = UpdateTaskStatusRequest.newBuilder().setTaskId(task.getTaskId())
                 .setStatus(status).setStartedAt(System.currentTimeMillis() / 1000)
                 .setCompletedAt(System.currentTimeMillis() / 1000).build();
 
-        server.getCoordinatorServiceClient().updateTaskStatus(request);
+        coordinatorServiceClient.updateTaskStatus(request);
     }
 
 }
