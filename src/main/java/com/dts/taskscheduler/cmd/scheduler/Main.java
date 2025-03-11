@@ -1,17 +1,19 @@
-package com.dts.taskscheduler.cmd.coordinator;
+package com.dts.taskscheduler.cmd.scheduler;
 
 import com.dts.taskscheduler.pkg.common.DatabaseConnection;
-import com.dts.taskscheduler.pkg.coordinator.CoordinatorServer;
+import com.dts.taskscheduler.pkg.scheduler.SchedulerServer;
 
 public class Main {
-    public static void main(String[] args) {
-        String coordinatorPort = "8080";
 
-        System.out.println("Coordinator Port: " + coordinatorPort);
+    public static void main(String[] args) {
+
+        String schedulerPort = "8081";
+
+        System.out.println("Scheduler Port: " + schedulerPort);
 
         String dbConnectionString = DatabaseConnection.getDBConnectionString();
 
-        CoordinatorServer server = CoordinatorServer.newServer(coordinatorPort, dbConnectionString);
+        SchedulerServer server = SchedulerServer.newServer(schedulerPort, dbConnectionString);
 
         try {
             server.start();
@@ -19,4 +21,5 @@ public class Main {
             System.err.println("Server failed to start: " + e.getMessage());
         }
     }
+
 }

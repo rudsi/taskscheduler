@@ -11,6 +11,7 @@ import javax.sql.DataSource;
 
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import io.github.cdimascio.dotenv.Dotenv;
 
 public class DatabaseConnection {
     private static final Logger logger = Logger.getLogger(DatabaseConnection.class.getName());
@@ -19,10 +20,11 @@ public class DatabaseConnection {
     private static HikariDataSource dataSource;
 
     public static DataSource connectToDatabase(String dbConnectionString) {
+
         if (dbConnectionString == null || dbConnectionString.isEmpty()) {
             throw new IllegalArgumentException("Database connection string must not be null or empty.");
         }
-        HikariConfig config = new HikariDataSource();
+        HikariConfig config = new HikariConfig();
         config.setJdbcUrl(dbConnectionString);
         config.setUsername(System.getenv("POSTGRES_USER"));
         config.setPassword(System.getenv("POSTGRES_PASSWORD"));
@@ -56,23 +58,24 @@ public class DatabaseConnection {
 
     public static String getDBConnectionString() {
         List<String> missingEnvVars = new ArrayList<>();
+        Dotenv dotenv = Dotenv.configure().filename(".env").load();
 
-        String dbUser = System.getenv("POSTGRES_USER");
+        String dbUser = dotenv.get("POSTGRES_USER");
         if (dbUser == null || dbUser.isEmpty()) {
             missingEnvVars.add("POSTGRES_USER");
         }
 
-        String dbPassword = System.getenv("POSTGRES_PASSWORD");
+        String dbPassword = dotenv.get("POSTGRES_PASSWORD");
         if (dbPassword == null || dbPassword.isEmpty()) {
             missingEnvVars.add("POSTGRES_PASSWORD");
         }
 
-        String dbName = System.getenv("POSTGRES_DB");
+        String dbName = dotenv.get("POSTGRES_DB");
         if (dbName == null || dbName.isEmpty()) {
             missingEnvVars.add("POSTGRES_DB");
         }
 
-        String dbHost = System.getenv("POSTGRES_HOST");
+        String dbHost = dotenv.get("POSTGRES_HOST");
         if (dbHost == null || dbHost.isEmpty()) {
             dbHost = "localhost";
         }
@@ -84,7 +87,8 @@ public class DatabaseConnection {
             System.exit(1);
         }
 
-        return String.format("postgres://%s:%s@%s:5432/%s", dbUser, dbPassword, dbHost, dbName);
+        return String.format("jdbc:postgresql://%s:5432/%s?user=%s&password=%s", dbHost, dbName, dbUser, dbPassword);
+
     }
 
 }

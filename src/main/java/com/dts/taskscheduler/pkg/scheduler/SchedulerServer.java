@@ -9,6 +9,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -220,7 +221,7 @@ class Task {
     }
 }
 
-class SchedulerServer {
+public class SchedulerServer {
     private static final Logger logger = Logger.getLogger(SchedulerServer.class.getName());
     private String serverPort;
     private String dbConnectionString;
@@ -252,6 +253,12 @@ class SchedulerServer {
 
     public void setDbConnectionString(String dbConnectionString) {
         this.dbConnectionString = dbConnectionString;
+    }
+
+    public static SchedulerServer newServer(String port, String dbConnectionString) {
+        return new SchedulerServer(
+                port,
+                dbConnectionString);
     }
 
     public void start() {
@@ -326,6 +333,7 @@ class SchedulerServer {
                     task.setCommand(commandRequest.getCommand());
                     task.setScheduledAt(unixTimestamp);
                     taskId = insertTaskIntoDB(task);
+
                 } catch (Exception e) {
                     String errorMessage = "Failed to submit task. Error: " + e.getMessage();
                     exchange.sendResponseHeaders(500, errorMessage.getBytes().length);
@@ -339,6 +347,7 @@ class SchedulerServer {
                 response.setCommand(commandRequest.getCommand());
                 response.setScheduledAt(unixTimestamp.getEpochSecond());
                 response.setTaskID(taskId);
+                System.out.println("came here");
 
                 String jsonResponse;
                 try {
@@ -391,20 +400,20 @@ class SchedulerServer {
             }
 
             String query = exchange.getRequestURI().getQuery();
-            String taskId = null;
+            UUID taskId = null;
 
             if (query != null) {
-                String[] params = query.split("&");
+                String[] params = query.split("?");
                 for (String param : params) {
                     String[] keyValue = param.split("=");
                     if (keyValue.length == 2 && "task_id".equals(keyValue[0])) {
-                        taskId = keyValue[1];
+                        taskId = UUID.fromString(keyValue[1]);
                         break;
                     }
                 }
             }
 
-            if (taskId == null || taskId.isEmpty()) {
+            if (taskId == null) {
                 String errorMessage = "Task ID is required";
                 exchange.sendResponseHeaders(400, errorMessage.getBytes().length);
                 try (OutputStream os = exchange.getResponseBody()) {
@@ -419,7 +428,7 @@ class SchedulerServer {
 
             try (Connection conn = dbPool.getConnection();
                     PreparedStatement stmt = conn.prepareStatement(sql)) {
-                stmt.setString(1, taskId);
+                stmt.setObject(1, taskId, java.sql.Types.OTHER);
                 try (ResultSet rs = stmt.executeQuery()) {
                     if (rs.next()) {
                         task = new Task();
