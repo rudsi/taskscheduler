@@ -126,7 +126,7 @@
         <!-- Use protoc 3.12.0 for compatibility -->
         <protocArtifact>com.google.protobuf:protoc:3.12.0:exe:${os.detected.classifier}</protocArtifact>
         <!-- Specify the proto source directory -->
-        <protoSourceRoot>C:\\Users\\akshs\\desktop\\dts\\taskscheduler\\src\\main\\proto</protoSourceRoot>
+        <protoSourceRoot>src/main/proto</protoSourceRoot>
         <!-- Prevent dependency artifacts from being added to the proto path -->
         <includeDependencies>true</includeDependencies>
       </configuration>

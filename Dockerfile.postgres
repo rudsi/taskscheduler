@@ -1,0 +1,6 @@
+FROM postgres:latest
+
+WORKDIR /docker-entrypoint-initdb.d/
+
+COPY src/main/java/com/dts/taskscheduler/pkg/db/schema.sql .
+

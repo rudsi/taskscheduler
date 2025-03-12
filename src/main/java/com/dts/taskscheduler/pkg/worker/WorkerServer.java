@@ -20,8 +20,6 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Logger;
 
 import com.dts.taskscheduler.pkg.grpc.CoordinatorServiceGrpc;
-import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskRequest;
-import com.dts.taskscheduler.pkg.grpc.Api.ClientTaskResponse;
 import com.dts.taskscheduler.pkg.grpc.Api.HeartbeatRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskRequest;
 import com.dts.taskscheduler.pkg.grpc.Api.TaskResponse;
