@@ -42,11 +42,13 @@ public class DatabaseConnection {
                     logger.info("Connected to the database.");
                     return dataSource;
                 }
+                // catch block missing
             } catch (SQLException e) {
                 logger.warning("Failed to connect to the database. Retrying in " + RETRY_DELAY_SECONDS + " seconds...");
                 try {
                     TimeUnit.SECONDS.sleep(RETRY_DELAY_SECONDS);
                 } catch (InterruptedException ignored) {
+                    // no handling
                 }
                 retryCount++;
             }

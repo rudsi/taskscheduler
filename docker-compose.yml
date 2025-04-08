@@ -1,52 +1,74 @@
-version: "3"
 services:
-  postgres:
-    build:
-      context: .
-      dockerfile: Dockerfile.postgres
+  worker1:
+    image: worker-image
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      - WORKER_ID=worker1
+      - HOST=worker1
+      - PORT=5000
     volumes:
-      - ./data:/var/lib/postgresql/data
+      - worker1_storage:/app/storage
+    networks:
+      - app_network
     ports:
-      - "5432:5432"
+      - "5001:5000"
+
+  worker2:
+    image: worker-image
+    environment:
+      - WORKER_ID=worker2
+      - HOST=worker2
+      - PORT=5000
+    volumes:
+      - worker2_storage:/app/storage
+    networks:
+      - app_network
+    ports:
+      - "5002:5000"
+
+  worker3:
+    image: worker-image
+    environment:
+      - WORKER_ID=worker3
+      - HOST=worker3
+      - PORT=5000
+    volumes:
+      - worker3_storage:/app/storage
+    networks:
+      - app_network
+    ports:
+      - "5003:5000"
+
+  worker4:
+    image: worker-image
+    environment:
+      - WORKER_ID=worker4
+      - HOST=worker4
+      - PORT=5000
+    volumes:
+      - worker4_storage:/app/storage
+    networks:
+      - app_network
+    ports:
+      - "5004:5000"
 
   scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile.scheduler
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_HOST: postgres
+    image: scheduler-image
+    depends_on:
+      - worker1
+      - worker2
+      - worker3
+      - worker4
+    networks:
+      - app_network
     ports:
-      - "8081:8081"
-    depends_on:
-      - postgres
+      - "6000:6000"
 
-  coordinator:
-    build:
-      context: .
-      dockerfile: Dockerfile.coordinator
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_HOST: postgres
-    ports:
-      - "8080:8080"
-    depends_on:
-      - postgres
+volumes:
+  worker1_storage:
+  worker2_storage:
+  worker3_storage:
+  worker4_storage:
 
-  worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    environment:
-      WORKER_ADDRESS: worker
-    depends_on:
-      - coordinator
-    env_file: .env
+networks:
+  app_network:
+    driver: bridge
